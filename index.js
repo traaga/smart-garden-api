@@ -7,11 +7,17 @@ import dotenv from 'dotenv';
 import { isSystemMetric, moistureToPercentage } from './helpers.js';
 import multer from 'multer';
 import path from 'path';
-import { fileURLToPath } from 'url';
+import webpush from 'web-push';
 
 dotenv.config();
 const app = express();
 const port = process.env.PORT || 3000;
+
+webpush.setVapidDetails(
+    'mailto:test@test.com',
+    process.env.VAPID_PUBLIC_KEY,
+    process.env.VAPID_PRIVATE_KEY
+)
 
 const sequelize = new Sequelize({
     dialect: 'sqlite',
@@ -52,49 +58,35 @@ Config.init({
     imagePath: {
         type: DataTypes.STRING,
         allowNull: true,
-    }
+    },
+    soilMoistureThreshold: {
+        type: DataTypes.INTEGER,
+        allowNull: true,
+    },
 }, { sequelize, modelName: 'config' });
+
+class Subscription extends Model { }
+Subscription.init({
+    id: {
+        type: DataTypes.STRING,
+        primaryKey: true,
+        allowNull: false,
+        unique: true,
+    },
+    data: {
+        type: DataTypes.STRING,
+        allowNull: false
+    },
+}, { sequelize, modelName: 'subscription' });
 
 sequelize.sync();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
-//app.use(express.static('public'));
-/*app.use(express.static('public', {
-    setHeaders: (res, path) => {
-        if (path.startsWith('/uploads/')) {
-            res.header('Access-Control-Allow-Origin', 'https://smart-garden.traaga.ee');
-            res.header('Access-Control-Allow-Headers', 'CF-Access-Client-Id, CF-Access-Client-Secret');
-            res.header('Access-Control-Allow-Credentials', 'true');
-        }
-    }
-}));*/
+app.use(express.static('public'));
 
 app.use(cors({
-    //origin: 'http://localhost:3001',
-    //origin: '*'
     origin: ['https://smart-garden.traaga.ee'],
 }));
-
-/*const corsOptions = {
-    origin: ['https://smart-garden.traaga.ee'],
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: [
-        'Access-Control-Allow-Origin',
-        'Content-Type',
-        'Authorization',
-        'X-Requested-With',
-        'Accept',
-        'Origin',
-        'CF-Access-Client-Id',
-        'CF-Access-Client-Secret'
-    ],
-    exposedHeaders: ['Content-Type', 'Content-Length'],
-    maxAge: 3600,
-    optionsSuccessStatus: 204
-};
-
-app.use(cors(corsOptions));*/
 
 const storage = multer.diskStorage({
     destination: './public/uploads/',
@@ -105,7 +97,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
     storage: storage,
-    limits: { fileSize: 5 * 1024 * 1024 } // 5MB limit
+    limits: { fileSize: 5 * 1024 * 1024 } // 5 MB limit
 });
 
 app.get('/online-nodes', async (req, res) => {
@@ -162,10 +154,16 @@ app.get('/online-nodes', async (req, res) => {
                     }
                 });
 
+                let showWarning = false;
+                if (item && item.soilMoistureThreshold && entry.fields.moisture) {
+                    showWarning = item.soilMoistureThreshold >= entry.fields.moisture;
+                }
+
                 if (item) {
                     entry.id = item.id;
                     entry.name = item.name;
                     entry.imageUrl = `${process.env.API_DOMAIN}${item.imagePath}`;
+                    entry.showWarning = showWarning;
                 } else {
                     console.error('Config not found:', id);
                 }
@@ -242,13 +240,11 @@ app.put('/config', async (req, res) => {
         if (!created) {
             // Config was found -> updating it.
 
-            console.log('req.body', req.body);
-
             item.name = req.body.name;
             item.version += 1;
             item.interval = req.body.interval;
             item.led_state = req.body.led_state;
-            console.log('AAAAAAAAAAA', item);
+            item.soilMoistureThreshold = req.body.soilMoistureThreshold;
 
             await item.save();
             return res.status(204).send();
@@ -426,40 +422,104 @@ app.post('/upload-image', upload.single('image'), async (req, res) => {
     }
 });
 
-/*app.get('/uploads/:filename', (req, res) => {
-    console.log('QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ');
-
-    const __filename = fileURLToPath(import.meta.url);
-    const __dirname = path.dirname(__filename);
-    
-    const filename = req.params.filename;
-    const filepath = path.join(__dirname, 'public', 'uploads', filename);
-    
-    // Set CORS headers explicitly for this route
-    //res.header('Access-Control-Allow-Origin', 'https://smart-garden.traaga.ee');
-    //res.header('Access-Control-Allow-Origin', '*');
-    //res.header('Access-Control-Allow-Headers', 'CF-Access-Client-Id, CF-Access-Client-Secret');
-    //res.header('Access-Control-Allow-Headers', '*');
-    //res.header('Access-Control-Allow-Credentials', 'true');
-    
-    res.sendFile(filepath, (err) => {
-        if (err) {
-            console.error('Error sending file:', err);
-            res.status(404).json({ error: 'Image not found' });
-        }
-    });
-});*/
-
-app.use(express.static('public'));
-/*app.use(express.static('public', {
-    setHeaders: (res, path) => {
-        if (path.startsWith('/uploads/')) {
-            res.header('Access-Control-Allow-Origin', '*');
-            res.header('Access-Control-Allow-Headers', '*');
-            res.header('Access-Control-Allow-Credentials', 'true');
-        }
+app.put('/subscription', async (req, res) => {
+    if (!req.body || typeof req.body !== 'object' || !req.body.id || !req.body.data) {
+        return res.status(400).json({
+            error: 'Invalid payload'
+        });
     }
-}));*/
+
+    try {
+        const [item, created] = await Subscription.findOrCreate({
+            where: { id: req.body.id.trim() },
+            defaults: req.body,
+        });
+
+        if (!created) {
+            // Subscription was found -> updating it.
+
+            item.data = req.body.data;
+
+            await item.save();
+            return res.status(204).send();
+        }
+
+        res.status(201).send();
+    } catch (error) {
+        console.error('Error handling config:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+app.delete('/subscription', async (req, res) => {
+    const { id } = req.query;
+
+    if (!id || id.trim().length === 0) {
+        return res.status(400).json({
+            error: 'Invalid or missing ID parameter'
+        });
+    }
+
+    try {
+        const deletedCount = await Subscription.destroy({
+            where: { id: id.trim() }
+        });
+
+        if (deletedCount === 0) {
+            return res.status(404).json({
+                error: 'Subscription not found'
+            });
+        }
+
+        res.status(204).send();
+    } catch (error) {
+        console.error('Error deleting subscription:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+app.get('/subscription', async (req, res) => {
+    const { id } = req.query;
+
+    if (!id || id.trim().length === 0) {
+        return res.status(400).json({
+            error: 'Invalid or missing ID parameter'
+        });
+    }
+
+    try {
+        const subscription = await Subscription.findByPk(id.trim());
+
+        if (!subscription) {
+            return res.status(404).json({
+                error: 'Subscription not found'
+            });
+        }
+
+        try {
+            const subscriptionData = JSON.parse(subscription.data);
+
+            await webpush.sendNotification(
+                subscriptionData,
+                JSON.stringify({
+                    title: 'Water me, please! 🌱',
+                    //body: 'Lorem Ipsum',
+                    icon: '/icon.svg',
+                })
+            );
+            res.status(200).json({ success: true });
+        } catch (error) {
+            console.error('Error sending push notification:', error);
+            res.status(500).json({
+                success: false,
+                error: 'Failed to send notification'
+            });
+        }
+    } catch (error) {
+        console.error('Error fetching subscription:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
 
 const server = app.listen(port, () => {
     console.log(`Smart Garden API listening on port ${port}`);
