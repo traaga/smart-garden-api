@@ -422,6 +422,65 @@ app.post('/upload-image', upload.single('image'), async (req, res) => {
     }
 });
 
+app.get('/subscription', async (req, res) => {
+    const { nodeId } = req.query;
+
+    if (!nodeId || nodeId.trim().length === 0) {
+        return res.status(400).json({
+            error: 'Invalid or missing node ID parameter'
+        });
+    }
+
+    try {
+        const fluxQuery = `
+            from(bucket: "${bucket}")
+                |> range(start: -48h)
+                |> filter(fn: (r) => r._measurement == "${nodeId}")
+                |> last()
+        `;
+
+        const result = {};
+
+        for await (const { values, tableMeta } of queryApi.iterateRows(fluxQuery)) {
+            const row = tableMeta.toObject(values);
+
+            result[row._field] = row._value;
+
+            if (row._field === 'moisture') {
+                result.moisture = moistureToPercentage(result.moisture);
+            }
+        }
+
+        const config = await Config.findByPk(nodeId.trim());
+
+        if (!config) {
+            return res.status(404).json({
+                error: 'Config not found'
+            });
+        }
+
+        let thresholdsReached = false;
+        let message = {
+            title: config.name,
+            body: '',
+            icon: '/icon.svg',
+        };
+
+        if(config.soilMoistureThreshold && result.moisture <= config.soilMoistureThreshold) {
+            thresholdsReached = true;
+            message.body = 'Water me, please! 🌱';
+        }
+
+        res.status(200).send({
+            thresholdsReached,
+            message,
+        });
+    } catch (error) {
+        console.error('Error checking thresholds:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 app.put('/subscription', async (req, res) => {
     if (!req.body || typeof req.body !== 'object' || !req.body.id || !req.body.data) {
         return res.status(400).json({
@@ -478,45 +537,53 @@ app.delete('/subscription', async (req, res) => {
     }
 });
 
-app.get('/subscription', async (req, res) => {
-    const { id } = req.query;
+app.post('/subscription', async (req, res) => {
+    const { ids, message } = req.body;
 
-    if (!id || id.trim().length === 0) {
+    if (!ids || !Array.isArray(ids)) {
         return res.status(400).json({
-            error: 'Invalid or missing ID parameter'
+            error: 'Invalid or missing IDs parameter'
+        });
+    }
+
+    if (!message || typeof message !== 'object') {
+        return res.status(400).json({
+            error: 'Invalid or missing message parameter'
         });
     }
 
     try {
-        const subscription = await Subscription.findByPk(id.trim());
+        let subscriptions;
 
-        if (!subscription) {
-            return res.status(404).json({
-                error: 'Subscription not found'
+        if (ids && Array.isArray(ids) && ids.length > 0) {
+            subscriptions = await Subscription.findAll({
+                where: { id: ids }
             });
+        } else {
+            subscriptions = await Subscription.findAll();
         }
 
-        try {
-            const subscriptionData = JSON.parse(subscription.data);
-
-            await webpush.sendNotification(
-                subscriptionData,
-                JSON.stringify({
-                    title: 'Water me, please! 🌱',
-                    //body: 'Lorem Ipsum',
-                    icon: '/icon.svg',
-                })
-            );
-            res.status(200).json({ success: true });
-        } catch (error) {
-            console.error('Error sending push notification:', error);
-            res.status(500).json({
-                success: false,
-                error: 'Failed to send notification'
-            });
+        if (subscriptions.length === 0) {
+            return res.status(404).json({ error: 'No subscriptions found' });
         }
+
+        await Promise.all(
+            subscriptions.map(async (subscription) => {
+                try {
+                    const subscriptionData = JSON.parse(subscription.data);
+                    await webpush.sendNotification(
+                        subscriptionData,
+                        JSON.stringify(message)
+                    );
+                } catch (error) {
+                    console.error(`Error sending notification to ${subscription.id}:`, error);
+                }
+            })
+        );
+
+        res.status(200).send();
     } catch (error) {
-        console.error('Error fetching subscription:', error);
+        console.error('Error processing subscriptions:', error);
         res.status(500).json({ error: 'Internal server error' });
     }
 });
