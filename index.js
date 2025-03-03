@@ -77,6 +77,9 @@ Subscription.init({
         type: DataTypes.STRING,
         allowNull: false
     },
+    lastSent: {
+        type: DataTypes.DATE,
+    },
 }, { sequelize, modelName: 'subscription' });
 
 sequelize.sync();
@@ -240,8 +243,11 @@ app.put('/config', async (req, res) => {
         if (!created) {
             // Config was found -> updating it.
 
+            if(item.interval != req.body.interval || item.led_state != req.body.led_state) {
+                item.version += 1;
+            }
+
             item.name = req.body.name;
-            item.version += 1;
             item.interval = req.body.interval;
             item.led_state = req.body.led_state;
             item.soilMoistureThreshold = req.body.soilMoistureThreshold;
@@ -316,7 +322,7 @@ app.get('/history-measurements', async (req, res) => {
             from(bucket: "${bucket}")
                 |> range(start: -24h)
                 |> filter(fn: (r) => r["_measurement"] == "${id}")
-                |> aggregateWindow(every: 1h, fn: median, createEmpty: false)
+                |> aggregateWindow(every: 15m, fn: median, createEmpty: false)
                 |> yield(name: "median")
         `;
 
@@ -466,7 +472,7 @@ app.get('/subscription', async (req, res) => {
             icon: '/icon.svg',
         };
 
-        if(config.soilMoistureThreshold && result.moisture <= config.soilMoistureThreshold) {
+        if(config.soilMoistureThreshold && result.moisture > 5 && result.moisture <= config.soilMoistureThreshold) {
             thresholdsReached = true;
             message.body = 'Water me, please! 🌱';
         }
@@ -569,12 +575,22 @@ app.post('/subscription', async (req, res) => {
 
         await Promise.all(
             subscriptions.map(async (subscription) => {
+                const waitPeriodInSeconds = 3 * 3600; // 3h
+                const secondsSinceLastSend = (Date.now() - subscription.lastSent.getTime()) / 1000;
+
+                if(secondsSinceLastSend < waitPeriodInSeconds) {
+                    return;
+                }
+                
                 try {
                     const subscriptionData = JSON.parse(subscription.data);
                     await webpush.sendNotification(
                         subscriptionData,
                         JSON.stringify(message)
                     );
+
+                    subscription.lastSent = Date.now();
+                    await subscription.save();
                 } catch (error) {
                     console.error(`Error sending notification to ${subscription.id}:`, error);
                 }
