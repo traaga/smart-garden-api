@@ -590,7 +590,8 @@ app.post('/subscription', async (req, res) => {
         await Promise.all(
             subscriptions.map(async (subscription) => {
                 const waitPeriodInSeconds = 3 * 3600; // 3h
-                const secondsSinceLastSend = (Date.now() - subscription.lastSent.getTime()) / 1000;
+                const lastSentInSeconds = subscription.lastSent ? subscription.lastSent.getTime() : 0;
+                const secondsSinceLastSend = (Date.now() - lastSentInSeconds) / 1000;
 
                 if (secondsSinceLastSend < waitPeriodInSeconds) {
                     return;
