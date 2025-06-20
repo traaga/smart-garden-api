@@ -85,11 +85,21 @@ Subscription.init({
 sequelize.sync();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
-app.use(express.static('public'));
 
 app.use(cors({
     origin: ['https://smart-garden.traaga.ee'],
+    credentials: true
 }));
+
+app.use('/uploads', (req, res, next) => {
+    console.log('req.path', req.path);
+    res.header('Access-Control-Allow-Origin', 'https://smart-garden.traaga.ee');
+    res.header('Access-Control-Allow-Methods', 'GET');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+    next();
+}, express.static('public/uploads/*'));
+
+app.use(express.static('public'));
 
 const storage = multer.diskStorage({
     destination: './public/uploads/',
@@ -120,40 +130,45 @@ app.get('/online-nodes', async (req, res) => {
             }
         }
 
-        // Then fetch latest entry for each measurement
-        const latestDataQuery = measurements.map(measurement => `
-            from(bucket: "${bucket}")
-                |> range(start: -48h)
-                |> filter(fn: (r) => r._measurement == "${measurement}")
-                |> last()
-        `).join('\n\n');
-
         const results = [];
-        for await (const { values, tableMeta } of queryApi.iterateRows(latestDataQuery)) {
-            const row = tableMeta.toObject(values);
-            const id = row._measurement;
 
-            // Find existing entry or create new one
-            let entry = results.find(r => r.id === id);
-            if (!entry) {
-                entry = {
-                    //name: influxDbId,
-                    //timestamp: row._time,
-                    fields: {}
-                };
-                results.push(entry);
+        // Process each measurement one at a time instead of joining them
+        for (const measurement of measurements) {
+            const latestDataQuery = `
+                from(bucket: "${bucket}")
+                    |> range(start: -48h)
+                    |> filter(fn: (r) => r._measurement == "${measurement}")
+                    |> last()
+            `;
+
+            for await (const { values, tableMeta } of queryApi.iterateRows(latestDataQuery)) {
+                const row = tableMeta.toObject(values);
+                const id = row._measurement;
+
+                // Find existing entry or create new one
+                let entry = results.find(r => r.id === id);
+                if (!entry) {
+                    entry = {
+                        id: id,
+                        fields: {}
+                    };
+                    results.push(entry);
+                }
+
+                entry.fields[row._field] = row._value;
+
+                if (entry.fields.moisture) {
+                    entry.fields.moisture = moistureToPercentage(entry.fields.moisture);
+                }
             }
+        }
 
-            entry.fields[row._field] = row._value;
-
-            if (entry.fields.moisture) {
-                entry.fields.moisture = moistureToPercentage(entry.fields.moisture);
-            }
-
+        // Fetch configuration data for all entries
+        for (const entry of results) {
             try {
                 const item = await Config.findOne({
                     where: {
-                        id,
+                        id: entry.id,
                     }
                 });
 
@@ -163,12 +178,11 @@ app.get('/online-nodes', async (req, res) => {
                 }
 
                 if (item) {
-                    entry.id = item.id;
                     entry.name = item.name;
-                    entry.imageUrl = `${process.env.API_DOMAIN}${item.imagePath}`;
+                    entry.imageUrl = item.imagePath ? `${process.env.API_DOMAIN}${item.imagePath}` : null;
                     entry.showWarning = showWarning;
                 } else {
-                    console.error('Config not found:', id);
+                    console.error('Config not found:', entry.id);
                 }
             } catch (error) {
                 console.error('Error fetching config:', error);
@@ -206,7 +220,7 @@ app.get('/config', async (req, res) => {
         const { imagePath, ...rest } = item.dataValues;
 
         const response = {
-            imageUrl: `${process.env.API_DOMAIN}${imagePath}`,
+            imageUrl: imagePath ? `${process.env.API_DOMAIN}${imagePath}` : null,
             ...rest,
         }
 
@@ -243,7 +257,7 @@ app.put('/config', async (req, res) => {
         if (!created) {
             // Config was found -> updating it.
 
-            if(item.interval != req.body.interval || item.led_state != req.body.led_state) {
+            if (item.interval != req.body.interval || item.led_state != req.body.led_state) {
                 item.version += 1;
             }
 
@@ -472,7 +486,7 @@ app.get('/subscription', async (req, res) => {
             icon: '/icon.svg',
         };
 
-        if(config.soilMoistureThreshold && result.moisture > 5 && result.moisture <= config.soilMoistureThreshold) {
+        if (config.soilMoistureThreshold && result.moisture > 5 && result.moisture <= config.soilMoistureThreshold) {
             thresholdsReached = true;
             message.body = 'Water me, please! 🌱';
         }
@@ -578,10 +592,10 @@ app.post('/subscription', async (req, res) => {
                 const waitPeriodInSeconds = 3 * 3600; // 3h
                 const secondsSinceLastSend = (Date.now() - subscription.lastSent.getTime()) / 1000;
 
-                if(secondsSinceLastSend < waitPeriodInSeconds) {
+                if (secondsSinceLastSend < waitPeriodInSeconds) {
                     return;
                 }
-                
+
                 try {
                     const subscriptionData = JSON.parse(subscription.data);
                     await webpush.sendNotification(
